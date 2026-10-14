@@ -137,6 +137,9 @@ type DB struct {
 	freelist     fl.Interface
 	freelistLoad sync.Once
 
+	// hist 为 nil 表示历史修订保留未启用；否则维护保留修订窗口。
+	hist *history
+
 	pagePool sync.Pool
 
 	batchMu sync.Mutex
@@ -183,6 +186,9 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	// Set default options if no options are provided.
 	if options == nil {
 		options = DefaultOptions
+	}
+	if options.HistoryLimit < 0 {
+		return nil, fmt.Errorf("HistoryLimit must be >= 0, got %d", options.HistoryLimit)
 	}
 	db.NoSync = options.NoSync
 	db.NoGrowSync = options.NoGrowSync
@@ -300,12 +306,30 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		return nil, err
 	}
 
+	// Load the retained-revision index before the freelist: the freelist
+	// (in particular its NoFreelistSync reconstruction) must not treat
+	// history-protected pages as free.
+	if err = db.loadHistory(options.HistoryLimit); err != nil {
+		_ = db.close()
+		lg.Errorf("failed to load history index from db file (%s): %v", path, err)
+		return nil, err
+	}
+
 	if db.PreLoadFreelist {
 		db.loadFreelist()
 	}
 
 	if db.readOnly {
 		return db, nil
+	}
+
+	// If history retention used to be enabled for this database but is now
+	// disabled, release all pages that were retained for old revisions and
+	// detach the history index in a single transaction.
+	if err = db.purgeHistoryOnOpen(); err != nil {
+		_ = db.close()
+		lg.Errorf("failed to purge history index from db file (%s): %v", path, err)
+		return nil, err
 	}
 
 	// Flush freelist when transitioning from no sync to sync so
@@ -1302,11 +1326,23 @@ func (db *DB) freepages() []common.Pgid {
 
 	// TODO: If check bucket reported any corruptions (ech) we shouldn't proceed to freeing the pages.
 
+	// Pages retained for historical revisions are not reachable from the
+	// current root but must not be reclaimed while their revisions are
+	// still inside the retention window.
+	var protected map[common.Pgid]struct{}
+	if db.hist != nil {
+		protected = db.hist.protectedPgids(db)
+	}
+
 	var fids []common.Pgid
 	for i := common.Pgid(2); i < db.meta().Pgid(); i++ {
-		if _, ok := reachable[i]; !ok {
-			fids = append(fids, i)
+		if _, ok := reachable[i]; ok {
+			continue
 		}
+		if _, skip := protected[i]; skip {
+			continue
+		}
+		fids = append(fids, i)
 	}
 	return fids
 }
@@ -1393,6 +1429,19 @@ type Options struct {
 	// return empty structure in this case. This can be beneficial for
 	// performance under high-concurrency read-only transactions.
 	NoStatistics bool
+
+	// HistoryLimit 开启历史修订保留：设置为正数 N 时，数据库保留最近 N 个
+	// 成功提交的修订（含当前修订），可通过 DB.ViewAt(id, fn) 按某次提交
+	// 事务的 Tx.ID() 只读访问当时的完整一致状态。
+	//
+	// 保留采用写时复制：仅当变化的页在窗口内被保留，存储随变化页与窗口
+	// 大小增长，不会因小更新复制整库；修订关闭重开数据库后仍可读取。
+	// 回滚或提交失败不会推进修订窗口。早于最老保留修订、晚于最新提交修订
+	// 或无效（含回滚造成空洞）的 ID 会从 ViewAt 返回错误，且不会执行回调。
+	//
+	// 0（默认）关闭该功能，此时数据库的打开、事务、回滚与最新视图行为与
+	// 未启用时完全一致。负数会导致 Open 返回错误。
+	HistoryLimit int
 }
 
 func (o *Options) String() string {
@@ -1400,8 +1449,8 @@ func (o *Options) String() string {
 		return "{}"
 	}
 
-	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
-		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t, HistoryLimit: %d}",
+		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics, o.HistoryLimit)
 
 }
 

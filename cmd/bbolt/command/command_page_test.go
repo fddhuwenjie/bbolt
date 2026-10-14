@@ -29,6 +29,7 @@ func TestPageCommand_Run(t *testing.T) {
 		"Root:       <pgid=3>\n" +
 		"Freelist:   <pgid=2>\n" +
 		"HWM:        <pgid=4>\n" +
+		"History:    <pgid=0>\n" +
 		"Txn ID:     0\n" +
 		"Checksum:   07516e114689fdee\n\n"
 

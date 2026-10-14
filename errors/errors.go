@@ -85,3 +85,32 @@ var (
 	// source and target buckets, while source and target buckets are in different database files.
 	ErrDifferentDB = errors.New("the source and target buckets are in different database files")
 )
+
+// These errors can occur when accessing retained historical revisions
+// through DB.ViewAt.
+var (
+	// ErrHistoryDisabled is returned from ViewAt when the database was
+	// opened without a positive Options.HistoryLimit.
+	ErrHistoryDisabled = errors.New("history revision retention is disabled")
+
+	// ErrRevisionInvalid is returned from ViewAt when the given revision id
+	// is not a positive transaction id.
+	ErrRevisionInvalid = errors.New("invalid revision id")
+
+	// ErrRevisionExpired is returned from ViewAt when the given revision id
+	// is older than the oldest retained revision.
+	ErrRevisionExpired = errors.New("revision expired")
+
+	// ErrRevisionNotFound is returned from ViewAt when the given revision id
+	// is inside the retained range but does not correspond to a successfully
+	// committed revision (e.g. it was skipped by a rolled back transaction).
+	ErrRevisionNotFound = errors.New("revision not found")
+
+	// ErrRevisionFuture is returned from ViewAt when the given revision id
+	// is greater than the latest committed revision.
+	ErrRevisionFuture = errors.New("revision is in the future")
+
+	// ErrHistoryCorrupt is returned when the persisted retained-revision index
+	// fails its integrity validation while opening a database.
+	ErrHistoryCorrupt = errors.New("history index is corrupt")
+)

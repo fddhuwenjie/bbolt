@@ -65,6 +65,36 @@ func (tx *Tx) check(cfg checkConfig, ch chan error) {
 		}
 	}
 
+	// Account for history index pages, per-revision page journals and old
+	// page versions still retained for historical views. They are not
+	// reachable from the current root nor present in the freelist.
+	if h := tx.db.hist; h != nil {
+		h.accountPages(tx.db, func(id common.Pgid, p *common.Page) {
+			reachable[id] = p
+		})
+		// While checking the writing transaction itself (StrictMode, right
+		// before the meta page is written), pages replaced or allocated by
+		// this transaction for the history layer have not yet been published
+		// in the in-memory window, so account for them explicitly.
+		if tx.writable {
+			for _, id := range tx.histFrees {
+				reachable[id] = tx.db.page(id)
+			}
+			if hp := tx.meta.History(); hp != 0 {
+				accountHistoryBlock(tx.db, hp, func(id common.Pgid, p *common.Page) {
+					reachable[id] = p
+				})
+			}
+			if n := len(tx.histPrepared); n > 0 {
+				if bp := tx.histPrepared[n-1].blobPgid; bp != 0 {
+					accountHistoryBlock(tx.db, bp, func(id common.Pgid, p *common.Page) {
+						reachable[id] = p
+					})
+				}
+			}
+		}
+	}
+
 	if cfg.pageId == 0 {
 		// Check the whole db file, starting from the root bucket and
 		// recursively check all child buckets.

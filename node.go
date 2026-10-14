@@ -489,7 +489,7 @@ func (n *node) dereference() {
 // free adds the node's underlying page to the freelist.
 func (n *node) free() {
 	if n.pgid != 0 {
-		n.bucket.tx.db.freelist.Free(n.bucket.tx.meta.Txid(), n.bucket.tx.page(n.pgid))
+		n.bucket.tx.db.freeDataPage(n.bucket.tx.meta.Txid(), n.bucket.tx.page(n.pgid))
 		n.pgid = 0
 	}
 }

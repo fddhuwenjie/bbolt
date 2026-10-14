@@ -20,6 +20,9 @@ const (
 	LeafPageFlag     = 0x02
 	MetaPageFlag     = 0x04
 	FreelistPageFlag = 0x10
+	// HistoryPageFlag marks pages that store the retained-revision index
+	// and its per-revision page journals.
+	HistoryPageFlag = 0x20
 )
 
 const (
@@ -54,6 +57,8 @@ func (p *Page) Typ() string {
 		return "meta"
 	} else if p.IsFreelistPage() {
 		return "freelist"
+	} else if p.IsHistoryPage() {
+		return "history"
 	}
 	return fmt.Sprintf("unknown<%02x>", p.flags)
 }
@@ -74,12 +79,17 @@ func (p *Page) IsFreelistPage() bool {
 	return p.flags == FreelistPageFlag
 }
 
+func (p *Page) IsHistoryPage() bool {
+	return p.flags == HistoryPageFlag
+}
+
 // IsValidPage checks Page flags correctness, only a single proper flag can be used.
 func (p *Page) IsValidPage() bool {
 	return p.IsBranchPage() ||
 		p.IsLeafPage() ||
 		p.IsMetaPage() ||
-		p.IsFreelistPage()
+		p.IsFreelistPage() ||
+		p.IsHistoryPage()
 }
 
 // Meta returns a pointer to the metadata section of the page.

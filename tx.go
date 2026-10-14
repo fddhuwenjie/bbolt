@@ -34,6 +34,11 @@ type Tx struct {
 	stats          TxStats
 	commitHandlers []func()
 
+	// histFrees 收集本次写事务中被替换、但可能仍需为保留修订保留的旧页。
+	// histPrepared 是 prepareCommit 计算出的新窗口，仅在提交成功后生效。
+	histFrees    []common.Pgid
+	histPrepared []histEntry
+
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
 	// Tx opens the database file with the specified flag to copy the data.
 	//
@@ -216,6 +221,19 @@ func (tx *Tx) Commit() (err error) {
 		tx.db.freelist.Free(tx.meta.Txid(), tx.db.page(tx.meta.Freelist()))
 	}
 
+	// Advance the retained-revision window before serializing the new
+	// freelist so that pages released by window eviction are included in
+	// the freelist page written by this commit. On failure rollback undoes
+	// the pending frees via freelist.Rollback and the retained window stays
+	// unchanged.
+	if tx.db.hist != nil && tx.db.hist.enabled {
+		if err = tx.db.hist.prepareCommit(tx); err != nil {
+			lg.Errorf("preparing history revision index failed: %v", err)
+			tx.rollback()
+			return err
+		}
+	}
+
 	if !tx.db.NoFreelistSync {
 		err = tx.commitFreelist()
 		if err != nil {
@@ -268,6 +286,11 @@ func (tx *Tx) Commit() (err error) {
 		lg.Errorf("writeMeta failed: %v", err)
 		tx.rollback()
 		return err
+	}
+
+	// The commit is durable now: publish the new retained-revision window.
+	if tx.db.hist != nil && tx.db.hist.enabled {
+		tx.db.hist.commitDone(tx)
 	}
 	tx.stats.IncWriteTime(time.Since(startTime))
 
@@ -375,6 +398,8 @@ func (tx *Tx) close() {
 	tx.meta = nil
 	tx.root = Bucket{tx: tx}
 	tx.pages = nil
+	tx.histFrees = nil
+	tx.histPrepared = nil
 }
 
 // Copy writes the entire database to a writer.

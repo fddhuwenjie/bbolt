@@ -909,7 +909,7 @@ func (b *Bucket) free() {
 	var tx = b.tx
 	b.forEachPageNode(func(p *common.Page, n *node, _ int) {
 		if p != nil {
-			tx.db.freelist.Free(tx.meta.Txid(), p)
+			tx.db.freeDataPage(tx.meta.Txid(), p)
 		} else {
 			n.free()
 		}

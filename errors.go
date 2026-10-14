@@ -106,3 +106,32 @@ var (
 	// Deprecated: Use the error variables defined in the bbolt/errors package.
 	ErrIncompatibleValue = errors.ErrIncompatibleValue
 )
+
+// Errors related to retained historical revisions (see Options.HistoryLimit
+// and DB.ViewAt).
+var (
+	// ErrHistoryDisabled is returned from ViewAt when the database was
+	// opened without a positive Options.HistoryLimit.
+	ErrHistoryDisabled = errors.ErrHistoryDisabled
+
+	// ErrRevisionInvalid is returned from ViewAt when the given revision id
+	// is not a positive transaction id.
+	ErrRevisionInvalid = errors.ErrRevisionInvalid
+
+	// ErrRevisionExpired is returned from ViewAt when the given revision id
+	// is older than the oldest retained revision.
+	ErrRevisionExpired = errors.ErrRevisionExpired
+
+	// ErrRevisionNotFound is returned from ViewAt when the given revision id
+	// falls inside the retained range but does not correspond to a
+	// successfully committed revision.
+	ErrRevisionNotFound = errors.ErrRevisionNotFound
+
+	// ErrRevisionFuture is returned from ViewAt when the given revision id
+	// is greater than the latest committed revision.
+	ErrRevisionFuture = errors.ErrRevisionFuture
+
+	// ErrHistoryCorrupt is returned when the persisted retained-revision
+	// index fails integrity validation while opening a database.
+	ErrHistoryCorrupt = errors.ErrHistoryCorrupt
+)
