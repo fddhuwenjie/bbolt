@@ -35,6 +35,10 @@ type Bucket struct {
 	rootNode *node                 // materialized node for the root page.
 	nodes    map[common.Pgid]*node // node cache
 
+	// ccPath 仅在并发写事务（DB.BeginConcurrent）中使用，记录该桶在本事务
+	// 中的完整路径，根桶为 nil；普通事务中始终为 nil。
+	ccPath [][]byte
+
 	// Sets the threshold for filling nodes when they split. By default,
 	// the bucket will fill to 50% but it can be useful to increase this
 	// amount if you know that your write workloads are mostly append-only.
@@ -106,6 +110,9 @@ func (b *Bucket) Bucket(name []byte) *Bucket {
 	if b.buckets != nil {
 		b.buckets[string(name)] = child
 	}
+	if b.tx.concurrent != nil {
+		child.ccPath = append(cloneSegments(b.ccPath), cloneBytes(name))
+	}
 
 	return child
 }
@@ -122,6 +129,12 @@ func (b *Bucket) openBucket(value []byte) *Bucket {
 	}{}) - 1
 	unaligned := uintptr(unsafe.Pointer(&value[0]))&unalignedMask != 0
 	if unaligned {
+		value = cloneBytes(value)
+	}
+
+	// 并发写事务不长期持有 mmap 读锁，桶头与内联页必须位于堆内存，避免
+	// 文件重新映射后引用失效。
+	if b.tx.concurrent != nil {
 		value = cloneBytes(value)
 	}
 
@@ -196,6 +209,10 @@ func (b *Bucket) CreateBucket(key []byte) (rb *Bucket, err error) {
 	// to be treated as a regular, non-inline bucket for the rest of the tx.
 	b.page = nil
 
+	if b.tx.concurrent != nil {
+		b.tx.concurrent.recordCreateBucket(b, newKey, false)
+	}
+
 	return b.Bucket(newKey), nil
 }
 
@@ -244,6 +261,9 @@ func (b *Bucket) CreateBucketIfNotExists(key []byte) (rb *Bucket, err error) {
 			if b.buckets != nil {
 				b.buckets[string(newKey)] = child
 			}
+			if b.tx.concurrent != nil {
+				child.ccPath = append(cloneSegments(b.ccPath), cloneBytes(newKey))
+			}
 
 			return child, nil
 		}
@@ -265,12 +285,23 @@ func (b *Bucket) CreateBucketIfNotExists(key []byte) (rb *Bucket, err error) {
 	// to be treated as a regular, non-inline bucket for the rest of the tx.
 	b.page = nil
 
+	if b.tx.concurrent != nil {
+		b.tx.concurrent.recordCreateBucket(b, newKey, true)
+	}
+
 	return b.Bucket(newKey), nil
 }
 
 // DeleteBucket deletes a bucket at the given key.
 // Returns an error if the bucket does not exist, or if the key represents a non-bucket value.
-func (b *Bucket) DeleteBucket(key []byte) (err error) {
+func (b *Bucket) DeleteBucket(key []byte) error {
+	return b.deleteBucket(key, true)
+}
+
+// deleteBucket 是 DeleteBucket 的内部实现。record 为 false 时表示它是并发
+// 写事务中顶层删桶触发的递归清理：不再重复记录操作（顶层操作已覆盖整个子
+// 树），并且不向共享 freelist 归还页面。
+func (b *Bucket) deleteBucket(key []byte, record bool) (err error) {
 	if lg := b.tx.db.Logger(); lg != discardLogger {
 		lg.Debugf("Deleting bucket %q", key)
 		defer func() {
@@ -292,7 +323,7 @@ func (b *Bucket) DeleteBucket(key []byte) (err error) {
 
 	// Move cursor to correct position.
 	c := b.Cursor()
-	k, _, flags := c.seek(newKey)
+	k, v, flags := c.seek(newKey)
 
 	// Return an error if bucket doesn't exist or is not a bucket.
 	if !bytes.Equal(newKey, k) {
@@ -303,8 +334,12 @@ func (b *Bucket) DeleteBucket(key []byte) (err error) {
 
 	// Recursively delete all child buckets.
 	child := b.Bucket(newKey)
+	if record && b.tx.concurrent != nil {
+		// 记录顶层删桶操作及其删除前的桶身份，供提交时冲突校验。
+		b.tx.concurrent.recordDeleteBucket(b, newKey, child, v)
+	}
 	err = child.ForEachBucket(func(k []byte) error {
-		if err := child.DeleteBucket(k); err != nil {
+		if err := child.deleteBucket(k, false); err != nil {
 			return fmt.Errorf("delete bucket: %s", err)
 		}
 		return nil
@@ -316,10 +351,15 @@ func (b *Bucket) DeleteBucket(key []byte) (err error) {
 	// Remove cached copy.
 	delete(b.buckets, string(newKey))
 
-	// Release all bucket pages to freelist.
+	// Release all bucket pages to freelist. Concurrent transactions never
+	// spill their private state, so the snapshot pages must remain owned by
+	// the file (they are additionally protected by the transaction's
+	// read-only txid registration in the freelist).
 	child.nodes = nil
 	child.rootNode = nil
-	child.free()
+	if b.tx.concurrent == nil {
+		child.free()
+	}
 
 	// Delete the node if we have a matching key.
 	c.node().del(newKey)
@@ -350,6 +390,12 @@ func (b *Bucket) MoveBucket(key []byte, dstBucket *Bucket) (err error) {
 		return errors.ErrTxClosed
 	} else if !b.Writable() || !dstBucket.Writable() {
 		return errors.ErrTxNotWritable
+	}
+
+	// 并发写事务通过逻辑操作日志在提交时重放，目前不为 MoveBucket 记录
+	// 这种跨桶结构变更，直接显式失败而不是静默丢修改。
+	if b.tx.concurrent != nil {
+		return errConcurrentMoveBucketUnsupported
 	}
 
 	if b.tx.db.Path() != dstBucket.tx.db.Path() || b.tx != dstBucket.tx {
@@ -479,7 +525,7 @@ func (b *Bucket) Put(key []byte, value []byte) (err error) {
 
 	// Move cursor to correct position.
 	c := b.Cursor()
-	k, _, flags := c.seek(newKey)
+	k, v, flags := c.seek(newKey)
 
 	// Return an error if there is an existing key with a bucket value.
 	if bytes.Equal(newKey, k) && (flags&common.BucketLeafFlag) != 0 {
@@ -487,6 +533,10 @@ func (b *Bucket) Put(key []byte, value []byte) (err error) {
 	}
 
 	// gofail: var beforeBucketPut struct{}
+
+	if b.tx.concurrent != nil {
+		b.tx.concurrent.recordKeyValue(b, newKey, v, ccOpPut, bytes.Equal(newKey, k), flags&common.BucketLeafFlag != 0, value)
+	}
 
 	c.node().put(newKey, newKey, value, 0, 0)
 
@@ -516,7 +566,7 @@ func (b *Bucket) Delete(key []byte) (err error) {
 
 	// Move cursor to correct position.
 	c := b.Cursor()
-	k, _, flags := c.seek(key)
+	k, v, flags := c.seek(key)
 
 	// Return nil if the key doesn't exist.
 	if !bytes.Equal(key, k) {
@@ -526,6 +576,10 @@ func (b *Bucket) Delete(key []byte) (err error) {
 	// Return an error if there is already existing bucket value.
 	if (flags & common.BucketLeafFlag) != 0 {
 		return errors.ErrIncompatibleValue
+	}
+
+	if b.tx.concurrent != nil {
+		b.tx.concurrent.recordKeyValue(b, key, v, ccOpDelete, true, false, nil)
 	}
 
 	// Delete the node if we have a matching key.
@@ -553,6 +607,10 @@ func (b *Bucket) SetSequence(v uint64) error {
 		_ = b.node(b.RootPage(), nil)
 	}
 
+	if b.tx.concurrent != nil {
+		b.tx.concurrent.recordSetSequence(b, v)
+	}
+
 	// Set the sequence.
 	b.SetInSequence(v)
 	return nil
@@ -570,6 +628,10 @@ func (b *Bucket) NextSequence() (uint64, error) {
 	// bucket will be saved during commit.
 	if b.rootNode == nil {
 		_ = b.node(b.RootPage(), nil)
+	}
+
+	if b.tx.concurrent != nil {
+		b.tx.concurrent.recordNextSequence(b)
 	}
 
 	// Increment and return the sequence.
@@ -892,6 +954,11 @@ func (b *Bucket) node(pgId common.Pgid, parent *node) *node {
 
 	// Read the page into the node and cache it.
 	n.read(p)
+	// 并发写事务拿到的是 mmap 页的临时堆副本，节点读入后立即把键/值
+	// 等数据复制到独立的堆内存，使其不再依赖该页副本或 mmap 映射地址。
+	if b.tx.concurrent != nil {
+		n.dereference()
+	}
 	b.nodes[pgId] = n
 
 	// Update statistics.

@@ -144,10 +144,13 @@ func (c *Cursor) Delete() error {
 		return errors.ErrTxNotWritable
 	}
 
-	key, _, flags := c.keyValue()
+	key, v, flags := c.keyValue()
 	// Return an error if current value is a bucket.
 	if (flags & common.BucketLeafFlag) != 0 {
 		return errors.ErrIncompatibleValue
+	}
+	if c.bucket.tx.concurrent != nil {
+		c.bucket.tx.concurrent.recordKeyValue(c.bucket, key, v, ccOpDelete, true, false, nil)
 	}
 	c.node().del(key)
 

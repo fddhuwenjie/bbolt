@@ -147,6 +147,10 @@ type DB struct {
 	mmaplock sync.RWMutex // Protects mmap access during remapping.
 	statlock sync.RWMutex // Protects stats access.
 
+	// concurrentTxns 跟踪所有通过 BeginConcurrent 打开且尚未结束的事务。
+	// Close 会等待它们结束，避免在并发事务仍在读取时关闭数据库。
+	concurrentTxns sync.WaitGroup
+
 	ops struct {
 		writeAt func(b []byte, off int64) (n int, err error)
 	}
@@ -692,6 +696,10 @@ func (db *DB) init() error {
 // It will block waiting for any open transactions to finish
 // before closing the database and returning.
 func (db *DB) Close() error {
+	// 等待所有 BeginConcurrent 事务结束：它们不长期持有 mmap 读锁，无法
+	// 像普通只读事务那样通过 mmaplock 阻塞关闭流程。
+	db.concurrentTxns.Wait()
+
 	db.rwlock.Lock()
 	defer db.rwlock.Unlock()
 

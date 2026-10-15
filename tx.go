@@ -34,6 +34,11 @@ type Tx struct {
 	stats          TxStats
 	commitHandlers []func()
 
+	// concurrent 非空时表示该事务由 DB.BeginConcurrent 创建。这类事务
+	// 基于只读快照在内存中接受写入，提交时在串行写事务上校验并重放，
+	// 自身永远不会直接写盘。
+	concurrent *concurrentTxnState
+
 	// WriteFlag specifies the flag for write-related methods like WriteTo().
 	// Tx opens the database file with the specified flag to copy the data.
 	//
@@ -188,6 +193,12 @@ func (tx *Tx) Commit() (err error) {
 		return berrors.ErrTxNotWritable
 	}
 
+	// 并发写事务不直接走本事务的 spill/write 流程，而是在最新已提交状态上
+	// 校验冲突并重放逻辑操作。
+	if tx.concurrent != nil {
+		return tx.commitConcurrent()
+	}
+
 	// TODO(benbjohnson): Use vectorized I/O to write out dirty pages.
 
 	// Rebalance nodes which have had deletions.
@@ -303,6 +314,11 @@ func (tx *Tx) Rollback() error {
 	common.Assert(!tx.managed, "managed tx rollback not allowed")
 	if tx.db == nil {
 		return berrors.ErrTxClosed
+	}
+	if tx.concurrent != nil {
+		// 并发写事务回滚只丢弃私有内存状态并注销快照登记，不触碰共享状态。
+		tx.rollbackConcurrent()
+		return nil
 	}
 	tx.nonPhysicalRollback()
 	return nil
@@ -635,8 +651,33 @@ func (tx *Tx) page(id common.Pgid) *common.Page {
 		}
 	}
 
+	// 并发写事务不长期持有 mmap 读锁，其他事务可能随时重新映射文件，
+	// 因此不能把指向 mmap 的页指针带出本方法：在读锁保护下把整页（含
+	// overflow 页）复制到堆内存后再返回。
+	if tx.concurrent != nil {
+		return tx.db.copyPage(id)
+	}
+
 	// Otherwise return directly from the mmap.
 	p := tx.db.page(id)
+	p.FastCheck(id)
+	return p
+}
+
+// copyPage 在 mmap 读锁保护下复制指定页（连同 overflow 页）到一块新的
+// 堆内存，使并发写事务在重新映射后仍可安全持有页内容。
+func (db *DB) copyPage(id common.Pgid) *common.Page {
+	db.mmaplock.RLock()
+	defer db.mmaplock.RUnlock()
+
+	src := db.page(id)
+	src.FastCheck(id)
+
+	size := int(src.Overflow()+1) * db.pageSize
+	buf := make([]byte, size)
+	copy(buf, common.UnsafeByteSlice(unsafe.Pointer(src), 0, 0, size))
+
+	p := (*common.Page)(unsafe.Pointer(&buf[0]))
 	p.FastCheck(id)
 	return p
 }
